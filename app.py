@@ -6,6 +6,8 @@ import pandas as pd
 import google.generativeai as genai
 import chainlit as cl
 from dotenv import load_dotenv
+from supabase import create_client, Client
+import hashlib, uuid
 
 load_dotenv()
 API_KEY   = os.getenv("GEMINI_API")
@@ -51,6 +53,56 @@ def guess_mime_type(path: str) -> str:
     return mt or "application/octet-stream"
 # --------------------------------------
 
+# ---------- Supabase client ----------
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "pins")
+
+supabase: Client | None = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def pin_file_supabase(user_id: str, local_path: str, mime_type: str) -> dict:
+    assert supabase is not None, "Supabase not configured"
+    filename    = os.path.basename(local_path)
+    digest      = _sha256(local_path)
+    size_bytes  = os.path.getsize(local_path)
+    storage_key = f"{user_id}/{digest}_{filename}"
+
+    with open(local_path, "rb") as f:
+        supabase.storage.from_(SUPABASE_BUCKET).upload(
+            storage_key, f, {"content-type": mime_type, "upsert": True}
+        )
+
+    row = {
+        "user_id": user_id,
+        "filename": filename,
+        "mime_type": mime_type,
+        "size_bytes": size_bytes,
+        "sha256": digest,
+        "storage_path": storage_key,
+    }
+    supabase.table("pinned_files").insert(row).execute()
+    return row
+
+def list_pins_supabase(user_id: str) -> list[dict]:
+    assert supabase is not None, "Supabase not configured"
+    res = supabase.table("pinned_files").select("*").eq("user_id", user_id)\
+        .order("created_at", desc=True).execute()
+    return res.data or []
+
+def signed_url(storage_key: str, expires_sec: int = 3600) -> str:
+    assert supabase is not None, "Supabase not configured"
+    return supabase.storage.from_(SUPABASE_BUCKET).create_signed_url(storage_key, expires_sec)["signedURL"]
+# --------------------------------------
+
 def read_excel_all_sheets(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".xlsx":
@@ -69,23 +121,37 @@ def read_excel_all_sheets(path: str) -> pd.DataFrame:
     out.columns = [str(c).strip() for c in out.columns]
     return out
 
-def make_snapshot(df: pd.DataFrame, max_rows: int = 400, max_chars: int = 60_000) -> str:
-    """Smaller caps to avoid overlong system prompts that can trip the API."""
+def make_snapshot(df: pd.DataFrame, max_rows: int = 120, max_cols: int = 20, max_chars: int = 18_000) -> str:
     if df is None or df.empty:
         return "NO_DATA"
-    head = "Columns: " + " | ".join([str(c) for c in df.columns]) + f"\nTotal Rows: {len(df)}"
-    csv = df.head(max_rows).to_csv(index=False)
+    use_cols = list(df.columns)[:max_cols]
+    dsmall = df[use_cols].copy()
+    for c in use_cols:
+        dsmall[c] = dsmall[c].astype(str)
+    head = (
+        "Columns: " + " | ".join([str(c) for c in use_cols]) +
+        f"\nTotal Rows: {len(df)} (showing first {min(len(df), max_rows)})"
+    )
+    csv = dsmall.head(max_rows).to_csv(index=False)
     if len(csv) > max_chars:
         csv = csv[:max_chars] + "\n...TRUNCATED..."
-    return head + "\n\nCSV Preview (capped):\n" + csv
+    snap = head + "\n\nCSV Preview (capped):\n" + csv
+    if len(snap) > max_chars + 2000:
+        snap = (
+            "Columns: " + " | ".join([str(c) for c in use_cols]) +
+            f"\nTotal Rows: {len(df)}\n\nCSV Preview (capped):\n(TRUNCATED)"
+        )
+    return snap
 
 def build_system_with_snapshot(snapshot: str | None) -> str:
+    base = BASE_SYSTEM_PROMPT
     if snapshot and snapshot.strip() and snapshot != "NO_DATA":
-        return BASE_SYSTEM_PROMPT + (
+        chunk = snapshot[:20_000]
+        return base + (
             "\n---\nINVENTORY SNAPSHOT (for grounding when relevant). "
-            "Do not dump this verbatim; cite only the bits you use:\n" + snapshot
+            "Do not dump this verbatim; cite only the bits you use:\n" + chunk
         )
-    return BASE_SYSTEM_PROMPT
+    return base
 
 async def ensure_chat():
     chat = cl.user_session.get("chat")
@@ -111,7 +177,7 @@ async def rebuild_with_snapshot(snapshot: str | None):
 def is_excel(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in (".xlsx", ".xls")
 
-# SVG loader (three bouncing dots)
+# SVG loader
 LOADER_HTML = """<div style="display:inline-block; padding:6px 2px;">
   <svg width="60" height="18" viewBox="0 0 60 18" xmlns="http://www.w3.org/2000/svg">
     <circle cx="10" cy="9" r="4" fill="currentColor">
@@ -136,11 +202,19 @@ async def on_start():
     cl.user_session.set("chat", chat)
     cl.user_session.set("snapshot", None)
 
+    # NEW: user_id + pins button
+    if not cl.user_session.get("user_id"):
+        cl.user_session.set("user_id", str(uuid.uuid4()))
+    await cl.Message(
+        content="Click to view your pinned files.",
+        actions=[cl.Action(name="show_pins", value="show", label="📎 Pinned Files")]
+    ).send()
+
     await cl.Message(
         content=(
             "Hi! 👋 I chat like ChatGPT.\n\n"
-            "Use the **paperclip in the input box** to attach your Excel inventory (and any PDFs/images). "
-            "I’ll remember a snapshot of your inventory and use it when relevant."
+            "Use the **paperclip** to attach your Excel inventory (and PDFs/images). "
+            "I’ll remember a snapshot and use it when relevant."
         )
     ).send()
 
@@ -156,51 +230,58 @@ async def on_message(message: cl.Message):
             continue
         (excel_paths if is_excel(path) else other_paths).append(path)
 
-    # If an Excel is present, (re)build snapshot
     if excel_paths:
         try:
-            df = read_excel_all_sheets(excel_paths[-1])  # last Excel wins
+            df = read_excel_all_sheets(excel_paths[-1])
             snap = make_snapshot(df)
             await rebuild_with_snapshot(snap)
             await cl.Message(
                 content=f"✅ Inventory attached ({len(df)} rows, {len(df.columns)} columns). I’ll use it when relevant."
             ).send()
+
+            # NEW: pin Excel file
+            if supabase:
+                try:
+                    mt_x = guess_mime_type(excel_paths[-1])
+                    pin_file_supabase(cl.user_session.get("user_id"), excel_paths[-1], mt_x)
+                except Exception as pe:
+                    print("Supabase pin (excel) failed:", repr(pe))
+
         except Exception as e:
             await cl.Message(content=f"❌ Error reading Excel: {e}").send()
 
-    # Ensure chat session
     chat = await ensure_chat()
 
-    # If there’s no user text and no non-Excel files, stop (prevents 400 on blank prompt)
     if not text.strip() and not other_paths:
         await cl.Message(
-            content="📎 Inventory noted. Now type a question (e.g., *“quote 25 pcs of item X”*), or attach a PDF/image to analyze."
+            content="📎 Inventory noted. Now type a question (e.g., *“quote 25 pcs of item X”*), or attach a PDF/image."
         ).send()
         return
 
-    # Show loader
     loader = cl.Message(content=LOADER_HTML)
     await loader.send()
 
-    # Upload non-Excel attachments to Gemini (with mime_type)
     gem_files = []
     for p in other_paths:
         try:
             mt = guess_mime_type(p)
             fh = genai.upload_file(path=p, mime_type=mt)
             gem_files.append(fh)
-        except Exception as e:
-            await cl.Message(
-                content=f"⚠️ Couldn’t upload an attachment: {os.path.basename(p)} ({e})"
-            ).send()
 
-    # Stream reply
+            # NEW: pin other files
+            if supabase:
+                try:
+                    pin_file_supabase(cl.user_session.get("user_id"), p, mt)
+                except Exception as pe:
+                    print("Supabase pin failed:", repr(pe))
+        except Exception as e:
+            await cl.Message(content=f"⚠️ Couldn’t upload: {os.path.basename(p)} ({e})").send()
+
     try:
         if gem_files:
             content = [text] + gem_files if text else gem_files
             resp = chat.send_message(content, stream=True)
         else:
-            # text is guaranteed non-empty here
             resp = chat.send_message(text, stream=True)
 
         first = True
@@ -210,24 +291,33 @@ async def on_message(message: cl.Message):
                 continue
             if first:
                 loader.content = token
-                await loader.update()       # swap HTML → first tokens
+                await loader.update()
                 first = False
             else:
                 await loader.stream_token(token)
         await loader.update()
 
-    except TypeError:
-        try:
-            if gem_files:
-                content = [text] + gem_files if text else gem_files
-                full = chat.send_message(content)
-            else:
-                full = chat.send_message(text)  # no blank " "
-            loader.content = full.text or "(No response.)"
-            await loader.update()
-        except Exception as e:
-            loader.content = f"❌ Gemini error: {e}"
-            await loader.update()
     except Exception as e:
         loader.content = f"❌ Gemini error: {e}"
         await loader.update()
+
+@cl.action_callback("show_pins")
+async def _show_pins(action):
+    if not supabase:
+        await cl.Message(content="Pins DB not configured.").send()
+        return
+    user_id = cl.user_session.get("user_id")
+    rows = list_pins_supabase(user_id)
+    if not rows:
+        await cl.Message(content="No pinned files yet.").send()
+        return
+
+    lines = []
+    for r in rows[:20]:
+        try:
+            url = signed_url(r["storage_path"], 3600)
+            size = r.get("size_bytes") or 0
+            lines.append(f"- [{r['filename']}]({url})  \n  {size} bytes")
+        except Exception:
+            lines.append(f"- {r['filename']} (cannot create link)")
+    await cl.Message(content="**Pinned files:**\n" + "\n".join(lines)).send()
