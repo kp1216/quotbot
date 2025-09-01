@@ -1,5 +1,6 @@
-# app.py
 import os
+import mimetypes
+from pathlib import Path
 import pandas as pd
 import google.generativeai as genai
 import chainlit as cl
@@ -24,6 +25,31 @@ else:
 
 def build_model(system_instruction: str):
     return genai.GenerativeModel(model_name=MODELNAME, system_instruction=system_instruction)
+
+# ---------- MIME type helper ----------
+MIME_OVERRIDES = {
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls":  "application/vnd.ms-excel",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".csv":  "text/csv",
+    ".json": "application/json",
+    ".md":   "text/markdown",
+    ".txt":  "text/plain",
+    ".pdf":  "application/pdf",
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp"
+}
+
+def guess_mime_type(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    if ext in MIME_OVERRIDES:
+        return MIME_OVERRIDES[ext]
+    mt, _ = mimetypes.guess_type(path)
+    return mt or "application/octet-stream"
+# --------------------------------------
 
 def read_excel_all_sheets(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
@@ -85,8 +111,7 @@ def is_excel(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in (".xlsx", ".xls")
 
 # SVG loader (three bouncing dots)
-LOADER_HTML = """
-<div style="display:inline-block; padding:6px 2px;">
+LOADER_HTML = """<div style="display:inline-block; padding:6px 2px;">
   <svg width="60" height="18" viewBox="0 0 60 18" xmlns="http://www.w3.org/2000/svg">
     <circle cx="10" cy="9" r="4" fill="currentColor">
       <animate attributeName="cy" values="9;3;9" dur="0.8s" repeatCount="indefinite" begin="0s"/>
@@ -98,8 +123,7 @@ LOADER_HTML = """
       <animate attributeName="cy" values="9;3;9" dur="0.8s" repeatCount="indefinite" begin="0.30s"/>
     </circle>
   </svg>
-</div>
-"""
+</div>"""
 
 @cl.on_chat_start
 async def on_start():
@@ -124,10 +148,6 @@ async def on_message(message: cl.Message):
     text = message.content or ""
     files = message.elements or []
 
-    # separate Excel vs other attachments
-    def is_excel(path: str) -> bool:
-        return os.path.splitext(path)[1].lower() in (".xlsx", ".xls")
-
     excel_paths, other_paths = [], []
     for el in files:
         path = getattr(el, "path", None) or getattr(el, "url", None)
@@ -147,10 +167,8 @@ async def on_message(message: cl.Message):
         except Exception as e:
             await cl.Message(content=f"❌ Error reading Excel: {e}").send()
 
-    # ensure chat session
     chat = await ensure_chat()
 
-    # show the 3-dot loader (HTML must be enabled in .chainlit/config.toml)
     loader = cl.Message(content=LOADER_HTML)
     await loader.send()
 
@@ -158,12 +176,14 @@ async def on_message(message: cl.Message):
     gem_files = []
     for p in other_paths:
         try:
-            fh = genai.upload_file(path=p)
+            mt = guess_mime_type(p)
+            fh = genai.upload_file(path=p, mime_type=mt)
             gem_files.append(fh)
         except Exception as e:
-            await cl.Message(content=f"⚠️ Couldn’t upload an attachment: {os.path.basename(p)} ({e})").send()
+            await cl.Message(
+                content=f"⚠️ Couldn’t upload an attachment: {os.path.basename(p)} ({e})"
+            ).send()
 
-    # stream the reply, replacing the loader’s HTML with text on first token
     try:
         if gem_files:
             content = [text] + gem_files if text else gem_files
@@ -178,15 +198,13 @@ async def on_message(message: cl.Message):
                 continue
             if first:
                 loader.content = token
-                await loader.update()       # swap HTML → first tokens
+                await loader.update()
                 first = False
             else:
                 await loader.stream_token(token)
 
-        await loader.update()               # finalize
-
+        await loader.update()
     except TypeError:
-        # non-streaming fallback
         try:
             if gem_files:
                 content = [text] + gem_files if text else gem_files
@@ -198,7 +216,6 @@ async def on_message(message: cl.Message):
         except Exception as e:
             loader.content = f"❌ Gemini error: {e}"
             await loader.update()
-
     except Exception as e:
         loader.content = f"❌ Gemini error: {e}"
         await loader.update()
