@@ -1,3 +1,4 @@
+# app.py
 import os
 import mimetypes
 from pathlib import Path
@@ -42,7 +43,6 @@ MIME_OVERRIDES = {
     ".jpeg": "image/jpeg",
     ".webp": "image/webp"
 }
-
 def guess_mime_type(path: str) -> str:
     ext = Path(path).suffix.lower()
     if ext in MIME_OVERRIDES:
@@ -69,7 +69,8 @@ def read_excel_all_sheets(path: str) -> pd.DataFrame:
     out.columns = [str(c).strip() for c in out.columns]
     return out
 
-def make_snapshot(df: pd.DataFrame, max_rows: int = 600, max_chars: int = 140_000) -> str:
+def make_snapshot(df: pd.DataFrame, max_rows: int = 400, max_chars: int = 60_000) -> str:
+    """Smaller caps to avoid overlong system prompts that can trip the API."""
     if df is None or df.empty:
         return "NO_DATA"
     head = "Columns: " + " | ".join([str(c) for c in df.columns]) + f"\nTotal Rows: {len(df)}"
@@ -155,7 +156,7 @@ async def on_message(message: cl.Message):
             continue
         (excel_paths if is_excel(path) else other_paths).append(path)
 
-    # attach or refresh inventory snapshot if an Excel is present
+    # If an Excel is present, (re)build snapshot
     if excel_paths:
         try:
             df = read_excel_all_sheets(excel_paths[-1])  # last Excel wins
@@ -167,12 +168,21 @@ async def on_message(message: cl.Message):
         except Exception as e:
             await cl.Message(content=f"❌ Error reading Excel: {e}").send()
 
+    # Ensure chat session
     chat = await ensure_chat()
 
+    # If there’s no user text and no non-Excel files, stop (prevents 400 on blank prompt)
+    if not text.strip() and not other_paths:
+        await cl.Message(
+            content="📎 Inventory noted. Now type a question (e.g., *“quote 25 pcs of item X”*), or attach a PDF/image to analyze."
+        ).send()
+        return
+
+    # Show loader
     loader = cl.Message(content=LOADER_HTML)
     await loader.send()
 
-    # upload non-Excel attachments to Gemini
+    # Upload non-Excel attachments to Gemini (with mime_type)
     gem_files = []
     for p in other_paths:
         try:
@@ -184,12 +194,14 @@ async def on_message(message: cl.Message):
                 content=f"⚠️ Couldn’t upload an attachment: {os.path.basename(p)} ({e})"
             ).send()
 
+    # Stream reply
     try:
         if gem_files:
             content = [text] + gem_files if text else gem_files
             resp = chat.send_message(content, stream=True)
         else:
-            resp = chat.send_message(text or " ", stream=True)
+            # text is guaranteed non-empty here
+            resp = chat.send_message(text, stream=True)
 
         first = True
         for chunk in resp:
@@ -198,19 +210,19 @@ async def on_message(message: cl.Message):
                 continue
             if first:
                 loader.content = token
-                await loader.update()
+                await loader.update()       # swap HTML → first tokens
                 first = False
             else:
                 await loader.stream_token(token)
-
         await loader.update()
+
     except TypeError:
         try:
             if gem_files:
                 content = [text] + gem_files if text else gem_files
                 full = chat.send_message(content)
             else:
-                full = chat.send_message(text or " ")
+                full = chat.send_message(text)  # no blank " "
             loader.content = full.text or "(No response.)"
             await loader.update()
         except Exception as e:
