@@ -207,7 +207,14 @@ async def on_start():
         cl.user_session.set("user_id", str(uuid.uuid4()))
     await cl.Message(
         content="Click to view your pinned files.",
-        actions=[cl.Action(name="show_pins", value="show", label="📎 Pinned Files")]
+        actions=[
+            cl.Action(
+                name="show_pins",
+                value="show",
+                label="📎 Pinned Files",
+                payload={}  # ✅ fixes Pydantic "payload required" error
+            )
+        ]
     ).send()
 
     await cl.Message(
@@ -303,6 +310,8 @@ async def on_message(message: cl.Message):
 
 @cl.action_callback("show_pins")
 async def _show_pins(action):
+    _payload = getattr(action, "payload", {})  # tolerate missing payload
+
     if not supabase:
         await cl.Message(content="Pins DB not configured.").send()
         return
