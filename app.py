@@ -1,0 +1,204 @@
+# app.py
+import os
+import pandas as pd
+import google.generativeai as genai
+import chainlit as cl
+from dotenv import load_dotenv
+
+load_dotenv()
+API_KEY   = os.getenv("GEMINI_API")
+MODELNAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+BASE_SYSTEM_PROMPT = (
+    "You are a friendly assistant. Answer naturally like ChatGPT.\n"
+    "If an Inventory Snapshot is provided below, prefer to ground inventory-related answers in it. "
+    "Do not fabricate values; if the snapshot lacks required info, say exactly what is missing and ask for it. "
+    "Use concise language and small Markdown tables when helpful.\n\n"
+    "IMPORTANT: Only reference the snapshot when relevant. For general questions, answer normally."
+)
+
+if not API_KEY:
+    print("WARNING: GEMINI_API_KEY is missing in .env")
+else:
+    genai.configure(api_key=API_KEY)
+
+def build_model(system_instruction: str):
+    return genai.GenerativeModel(model_name=MODELNAME, system_instruction=system_instruction)
+
+def read_excel_all_sheets(path: str) -> pd.DataFrame:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xlsx":
+        sheets = pd.read_excel(path, sheet_name=None, engine="openpyxl")
+    elif ext == ".xls":
+        sheets = pd.read_excel(path, sheet_name=None, engine="xlrd")
+    else:
+        raise ValueError("Only Excel files are supported: .xlsx or .xls")
+    frames = []
+    for sname, df in sheets.items():
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            d2 = df.copy()
+            d2["__sheet__"] = sname
+            frames.append(d2)
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+def make_snapshot(df: pd.DataFrame, max_rows: int = 600, max_chars: int = 140_000) -> str:
+    if df is None or df.empty:
+        return "NO_DATA"
+    head = "Columns: " + " | ".join([str(c) for c in df.columns]) + f"\nTotal Rows: {len(df)}"
+    csv = df.head(max_rows).to_csv(index=False)
+    if len(csv) > max_chars:
+        csv = csv[:max_chars] + "\n...TRUNCATED..."
+    return head + "\n\nCSV Preview (capped):\n" + csv
+
+def build_system_with_snapshot(snapshot: str | None) -> str:
+    if snapshot and snapshot.strip() and snapshot != "NO_DATA":
+        return BASE_SYSTEM_PROMPT + (
+            "\n---\nINVENTORY SNAPSHOT (for grounding when relevant). "
+            "Do not dump this verbatim; cite only the bits you use:\n" + snapshot
+        )
+    return BASE_SYSTEM_PROMPT
+
+async def ensure_chat():
+    chat = cl.user_session.get("chat")
+    if chat is None:
+        model = cl.user_session.get("model")
+        if model is None:
+            sys = build_system_with_snapshot(cl.user_session.get("snapshot"))
+            model = build_model(sys)
+            cl.user_session.set("model", model)
+        chat = model.start_chat(history=[])
+        cl.user_session.set("chat", chat)
+    return chat
+
+async def rebuild_with_snapshot(snapshot: str | None):
+    cl.user_session.set("snapshot", snapshot)
+    sys = build_system_with_snapshot(snapshot)
+    model = build_model(sys)
+    cl.user_session.set("model", model)
+    chat = model.start_chat(history=[])
+    cl.user_session.set("chat", chat)
+    return chat
+
+def is_excel(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in (".xlsx", ".xls")
+
+# SVG loader (three bouncing dots)
+LOADER_HTML = """
+<div style="display:inline-block; padding:6px 2px;">
+  <svg width="60" height="18" viewBox="0 0 60 18" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="10" cy="9" r="4" fill="currentColor">
+      <animate attributeName="cy" values="9;3;9" dur="0.8s" repeatCount="indefinite" begin="0s"/>
+    </circle>
+    <circle cx="30" cy="9" r="4" fill="currentColor">
+      <animate attributeName="cy" values="9;3;9" dur="0.8s" repeatCount="indefinite" begin="0.15s"/>
+    </circle>
+    <circle cx="50" cy="9" r="4" fill="currentColor">
+      <animate attributeName="cy" values="9;3;9" dur="0.8s" repeatCount="indefinite" begin="0.30s"/>
+    </circle>
+  </svg>
+</div>
+"""
+
+@cl.on_chat_start
+async def on_start():
+    sys = build_system_with_snapshot(None)
+    model = build_model(sys)
+    chat = model.start_chat(history=[])
+
+    cl.user_session.set("model", model)
+    cl.user_session.set("chat", chat)
+    cl.user_session.set("snapshot", None)
+
+    await cl.Message(
+        content=(
+            "Hi! 👋 I chat like ChatGPT.\n\n"
+            "Use the **paperclip in the input box** to attach your Excel inventory (and any PDFs/images). "
+            "I’ll remember a snapshot of your inventory and use it when relevant."
+        )
+    ).send()
+
+@cl.on_message
+async def on_message(message: cl.Message):
+    text = message.content or ""
+    files = message.elements or []
+
+    # separate Excel vs other attachments
+    def is_excel(path: str) -> bool:
+        return os.path.splitext(path)[1].lower() in (".xlsx", ".xls")
+
+    excel_paths, other_paths = [], []
+    for el in files:
+        path = getattr(el, "path", None) or getattr(el, "url", None)
+        if not path:
+            continue
+        (excel_paths if is_excel(path) else other_paths).append(path)
+
+    # attach or refresh inventory snapshot if an Excel is present
+    if excel_paths:
+        try:
+            df = read_excel_all_sheets(excel_paths[-1])  # last Excel wins
+            snap = make_snapshot(df)
+            await rebuild_with_snapshot(snap)
+            await cl.Message(
+                content=f"✅ Inventory attached ({len(df)} rows, {len(df.columns)} columns). I’ll use it when relevant."
+            ).send()
+        except Exception as e:
+            await cl.Message(content=f"❌ Error reading Excel: {e}").send()
+
+    # ensure chat session
+    chat = await ensure_chat()
+
+    # show the 3-dot loader (HTML must be enabled in .chainlit/config.toml)
+    loader = cl.Message(content=LOADER_HTML)
+    await loader.send()
+
+    # upload non-Excel attachments to Gemini
+    gem_files = []
+    for p in other_paths:
+        try:
+            fh = genai.upload_file(path=p)
+            gem_files.append(fh)
+        except Exception as e:
+            await cl.Message(content=f"⚠️ Couldn’t upload an attachment: {os.path.basename(p)} ({e})").send()
+
+    # stream the reply, replacing the loader’s HTML with text on first token
+    try:
+        if gem_files:
+            content = [text] + gem_files if text else gem_files
+            resp = chat.send_message(content, stream=True)
+        else:
+            resp = chat.send_message(text or " ", stream=True)
+
+        first = True
+        for chunk in resp:
+            token = getattr(chunk, "text", None)
+            if not token:
+                continue
+            if first:
+                loader.content = token
+                await loader.update()       # swap HTML → first tokens
+                first = False
+            else:
+                await loader.stream_token(token)
+
+        await loader.update()               # finalize
+
+    except TypeError:
+        # non-streaming fallback
+        try:
+            if gem_files:
+                content = [text] + gem_files if text else gem_files
+                full = chat.send_message(content)
+            else:
+                full = chat.send_message(text or " ")
+            loader.content = full.text or "(No response.)"
+            await loader.update()
+        except Exception as e:
+            loader.content = f"❌ Gemini error: {e}"
+            await loader.update()
+
+    except Exception as e:
+        loader.content = f"❌ Gemini error: {e}"
+        await loader.update()

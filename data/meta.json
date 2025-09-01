@@ -1,0 +1,27 @@
+{
+  "cleared_at": "2025-08-30T19:39:40",
+  "history": [
+    {
+      "time": "2025-08-30T19:40:47",
+      "policy": "replace",
+      "files": [
+        {
+          "file": "20250830-194047__c8dc4294e90a__inventory.xlsx",
+          "rows": 11
+        }
+      ],
+      "rows_after": 11
+    },
+    {
+      "time": "2025-08-30T19:40:49",
+      "policy": "replace",
+      "files": [
+        {
+          "file": "20250830-194049__c8dc4294e90a__inventory.xlsx",
+          "rows": 11
+        }
+      ],
+      "rows_after": 11
+    }
+  ]
+}
