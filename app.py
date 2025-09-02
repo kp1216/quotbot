@@ -16,7 +16,7 @@ from supabase import create_client, Client
 load_dotenv()
 
 API_KEY   = os.getenv("GEMINI_API")
-MODELNAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODELNAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 BASE_SYSTEM_PROMPT = (
     "You are a friendly assistant. Answer naturally like ChatGPT.\n"
