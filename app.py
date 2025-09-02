@@ -242,6 +242,10 @@ async def on_start():
 # ----------------- MESSAGE HANDLER -----------------
 
 
+import tempfile
+import pandas as pd
+import os
+
 @cl.on_message
 async def on_message(message: cl.Message):
     text = message.content or ""
@@ -253,6 +257,8 @@ async def on_message(message: cl.Message):
         if not path:
             continue
         (excel_paths if is_excel(path) else other_paths).append(path)
+
+    gem_files = []
 
     if excel_paths:
         try:
@@ -271,21 +277,19 @@ async def on_message(message: cl.Message):
                 except Exception as pe:
                     print("Supabase pin (excel) failed:", repr(pe))
 
-            # Gemini: upload CSV version (not raw Excel, avoids 400 error)
-            csv_buf = io.StringIO()
-            df.to_csv(csv_buf, index=False)
-            csv_buf.seek(0)
+            # ✅ Gemini: upload a temporary CSV file instead of Excel
+            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+                df.to_csv(tmp.name, index=False)
+                tmp_path = tmp.name
+
             gem_csv = genai.upload_file(
-                path=csv_buf,
-                display_name=os.path.basename(excel_paths[-1]).replace(".xlsx", ".csv").replace(".xls", ".csv"),
+                path=tmp_path,
                 mime_type="text/csv",
             )
-            gem_files = [gem_csv]
+            gem_files.append(gem_csv)
+
         except Exception as e:
             await cl.Message(content=f"❌ Error reading Excel: {e}").send()
-            gem_files = []
-    else:
-        gem_files = []
 
     chat = await ensure_chat()
 
