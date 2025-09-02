@@ -4,6 +4,7 @@ import mimetypes
 from pathlib import Path
 import hashlib
 import uuid
+import io
 
 import pandas as pd
 import google.generativeai as genai
@@ -239,6 +240,8 @@ async def on_start():
     ).send()
 
 # ----------------- MESSAGE HANDLER -----------------
+
+
 @cl.on_message
 async def on_message(message: cl.Message):
     text = message.content or ""
@@ -260,18 +263,33 @@ async def on_message(message: cl.Message):
                 content=f"✅ Inventory attached ({len(df)} rows, {len(df.columns)} columns). I’ll use it when relevant."
             ).send()
 
+            # Supabase: upload original Excel
             if supabase:
                 try:
                     mt_x = guess_mime_type(excel_paths[-1])
                     pin_file_supabase(cl.user_session.get("user_id"), excel_paths[-1], mt_x, overwrite=True)
                 except Exception as pe:
                     print("Supabase pin (excel) failed:", repr(pe))
+
+            # Gemini: upload CSV version (not raw Excel, avoids 400 error)
+            csv_buf = io.StringIO()
+            df.to_csv(csv_buf, index=False)
+            csv_buf.seek(0)
+            gem_csv = genai.upload_file(
+                path=csv_buf,
+                display_name=os.path.basename(excel_paths[-1]).replace(".xlsx", ".csv").replace(".xls", ".csv"),
+                mime_type="text/csv",
+            )
+            gem_files = [gem_csv]
         except Exception as e:
             await cl.Message(content=f"❌ Error reading Excel: {e}").send()
+            gem_files = []
+    else:
+        gem_files = []
 
     chat = await ensure_chat()
 
-    if not text.strip() and not other_paths:
+    if not text.strip() and not other_paths and not excel_paths:
         await cl.Message(
             content="📎 Inventory noted. Now type a question (e.g., *“quote 25 pcs of item X”*), or attach a PDF/image."
         ).send()
@@ -280,7 +298,6 @@ async def on_message(message: cl.Message):
     loader = cl.Message(content=LOADER_HTML)
     await loader.send()
 
-    gem_files = []
     for p in other_paths:
         try:
             mt = guess_mime_type(p)
@@ -317,6 +334,7 @@ async def on_message(message: cl.Message):
         print("Gemini error detail:", repr(e))
         loader.content = f"❌ Gemini error: {e}"
         await loader.update()
+
 
 # ----------------- ACTION: SHOW PINS -----------------
 @cl.action_callback("show_pins")
