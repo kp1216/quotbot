@@ -16,8 +16,8 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # =============================
 # Gemini Setup
 # =============================
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-model = genai.GenerativeModel("gemini-1.5-pro")
+genai.configure(api_key=os.getenv("GEMINI_API"))
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 # =============================
 # Helpers
