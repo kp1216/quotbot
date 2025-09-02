@@ -242,9 +242,7 @@ async def on_start():
 # ----------------- MESSAGE HANDLER -----------------
 
 
-import tempfile
-import pandas as pd
-import os
+
 
 @cl.on_message
 async def on_message(message: cl.Message):
@@ -258,8 +256,6 @@ async def on_message(message: cl.Message):
             continue
         (excel_paths if is_excel(path) else other_paths).append(path)
 
-    gem_files = []
-
     if excel_paths:
         try:
             df = read_excel_all_sheets(excel_paths[-1])
@@ -269,31 +265,18 @@ async def on_message(message: cl.Message):
                 content=f"✅ Inventory attached ({len(df)} rows, {len(df.columns)} columns). I’ll use it when relevant."
             ).send()
 
-            # Supabase: upload original Excel
             if supabase:
                 try:
                     mt_x = guess_mime_type(excel_paths[-1])
                     pin_file_supabase(cl.user_session.get("user_id"), excel_paths[-1], mt_x, overwrite=True)
                 except Exception as pe:
                     print("Supabase pin (excel) failed:", repr(pe))
-
-            # ✅ Gemini: upload a temporary CSV file instead of Excel
-            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
-                df.to_csv(tmp.name, index=False)
-                tmp_path = tmp.name
-
-            gem_csv = genai.upload_file(
-                path=tmp_path,
-                mime_type="text/csv",
-            )
-            gem_files.append(gem_csv)
-
         except Exception as e:
             await cl.Message(content=f"❌ Error reading Excel: {e}").send()
 
     chat = await ensure_chat()
 
-    if not text.strip() and not other_paths and not excel_paths:
+    if not text.strip() and not other_paths:
         await cl.Message(
             content="📎 Inventory noted. Now type a question (e.g., *“quote 25 pcs of item X”*), or attach a PDF/image."
         ).send()
@@ -302,6 +285,7 @@ async def on_message(message: cl.Message):
     loader = cl.Message(content=LOADER_HTML)
     await loader.send()
 
+    gem_files = []
     for p in other_paths:
         try:
             mt = guess_mime_type(p)
@@ -338,6 +322,7 @@ async def on_message(message: cl.Message):
         print("Gemini error detail:", repr(e))
         loader.content = f"❌ Gemini error: {e}"
         await loader.update()
+
 
 
 # ----------------- ACTION: SHOW PINS -----------------
