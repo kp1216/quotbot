@@ -5,6 +5,8 @@ from pathlib import Path
 import hashlib
 import uuid
 import io
+import tempfile
+import zipfile
 
 import pandas as pd
 import google.generativeai as genai
@@ -17,6 +19,11 @@ load_dotenv()
 
 API_KEY   = os.getenv("GEMINI_API")
 MODELNAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+# Excel→CSV behavior (optional envs)
+EXCEL_SHEETS_MODE   = os.getenv("EXCEL_SHEETS_MODE", "all").strip().lower()  # "all" or "first"
+INCLUDE_INDEX_IN_CSV = os.getenv("INCLUDE_INDEX_IN_CSV", "false").strip().lower() in ("1","true","yes")
+MAX_SHEETS_TO_UPLOAD = int(os.getenv("MAX_SHEETS_TO_UPLOAD", "10"))
 
 BASE_SYSTEM_PROMPT = (
     "You are a friendly assistant. Answer naturally like ChatGPT.\n"
@@ -198,6 +205,39 @@ async def rebuild_with_snapshot(snapshot: str | None):
 def is_excel(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in (".xlsx", ".xls")
 
+# -------- Excel → CSV conversion (integrated from your Gradio app) --------
+def _safe_name(s: str) -> str:
+    return "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in (s or "")).strip() or "Sheet"
+
+def excel_to_csv_paths(excel_path: str, mode: str = "all", include_index: bool = False, max_sheets: int = 10) -> list[str]:
+    """
+    Returns a list of CSV file paths (one per selected sheet).
+    - mode: 'all' (default) or 'first'
+    - include_index: include pandas index column in CSV
+    - max_sheets: cap how many sheets to export (safety)
+    """
+    if not excel_path:
+        return []
+    xls = pd.ExcelFile(excel_path)
+    sheets = xls.sheet_names or []
+    if not sheets:
+        return []
+
+    out_paths: list[str] = []
+    chosen = sheets if mode == "all" else sheets[:1]
+    chosen = chosen[:max_sheets]
+
+    base = os.path.splitext(os.path.basename(excel_path))[0]
+    for s in chosen:
+        df = pd.read_excel(excel_path, sheet_name=s)
+        safe_sheet = _safe_name(s)
+        out_name = f"{base}__{safe_sheet}.csv"
+        out_path = os.path.join(tempfile.gettempdir(), next(tempfile._get_candidate_names()) + "_" + out_name)
+        df.to_csv(out_path, index=include_index, encoding="utf-8-sig")
+        out_paths.append(out_path)
+
+    return out_paths
+
 # ----------------- UI -----------------
 LOADER_HTML = """<div style="display:inline-block; padding:6px 2px;">
   <svg width="60" height="18" viewBox="0 0 60 18" xmlns="http://www.w3.org/2000/svg">
@@ -235,15 +275,12 @@ async def on_start():
         content=(
             "Hi! 👋 I chat like ChatGPT.\n\n"
             "Use the **paperclip** to attach your Excel inventory (and PDFs/images). "
-            "I’ll remember a snapshot and use it when relevant."
+            "I’ll remember a snapshot and use it when relevant.\n"
+            "_Excel files are auto-converted to CSV and sent to Gemini for you._"
         )
     ).send()
 
 # ----------------- MESSAGE HANDLER -----------------
-
-
-
-
 @cl.on_message
 async def on_message(message: cl.Message):
     text = message.content or ""
@@ -256,36 +293,69 @@ async def on_message(message: cl.Message):
             continue
         (excel_paths if is_excel(path) else other_paths).append(path)
 
+    # We'll accumulate all Gemini-uploadable files (including converted CSVs) here
+    gem_files = []
+
+    # If an Excel was uploaded: snapshot + convert to CSV + upload to Gemini + pin
     if excel_paths:
         try:
+            # Snapshot from ALL sheets (for grounding)
             df = read_excel_all_sheets(excel_paths[-1])
             snap = make_snapshot(df)
             await rebuild_with_snapshot(snap)
             await cl.Message(
-                content=f"✅ Inventory attached ({len(df)} rows, {len(df.columns)} columns). I’ll use it when relevant."
+                content=f"✅ Inventory attached ({len(df)} rows, {len(df.columns)} columns). Using it when relevant.\n"
+                        f"🗂️ Converting Excel→CSV for Gemini…"
             ).send()
 
+            # Convert to CSV(s)
+            csv_paths = excel_to_csv_paths(
+                excel_paths[-1],
+                mode=EXCEL_SHEETS_MODE,
+                include_index=INCLUDE_INDEX_IN_CSV,
+                max_sheets=MAX_SHEETS_TO_UPLOAD
+            )
+
+            # Upload each CSV to Gemini and pin
+            for p in csv_paths:
+                try:
+                    fh = genai.upload_file(path=p, mime_type="text/csv")
+                    gem_files.append(fh)
+                    if supabase:
+                        try:
+                            pin_file_supabase(cl.user_session.get("user_id"), p, "text/csv", overwrite=True)
+                        except Exception as pe:
+                            print("Supabase pin (csv) failed:", repr(pe))
+                except Exception as up_e:
+                    await cl.Message(content=f"⚠️ Couldn’t upload CSV '{os.path.basename(p)}' to Gemini: {up_e}").send()
+
+            # Also pin the original Excel (optional, for your audit trail)
             if supabase:
                 try:
                     mt_x = guess_mime_type(excel_paths[-1])
                     pin_file_supabase(cl.user_session.get("user_id"), excel_paths[-1], mt_x, overwrite=True)
                 except Exception as pe:
                     print("Supabase pin (excel) failed:", repr(pe))
+
+            await cl.Message(
+                content=f"📄 Sent {len(csv_paths)} CSV file(s) from the workbook to Gemini."
+            ).send()
+
         except Exception as e:
-            await cl.Message(content=f"❌ Error reading Excel: {e}").send()
+            await cl.Message(content=f"❌ Error handling Excel: {e}").send()
 
     chat = await ensure_chat()
 
-    if not text.strip() and not other_paths:
+    if not text.strip() and not other_paths and not gem_files:
         await cl.Message(
-            content="📎 Inventory noted. Now type a question (e.g., *“quote 25 pcs of item X”*), or attach a PDF/image."
+            content="📎 Inventory noted & CSVs uploaded. Now type a question (e.g., *“quote 25 pcs of item X”*), or attach a PDF/image."
         ).send()
         return
 
     loader = cl.Message(content=LOADER_HTML)
     await loader.send()
 
-    gem_files = []
+    # Upload any non-excel attachments (pdf/images/etc) to Gemini + pin
     for p in other_paths:
         try:
             mt = guess_mime_type(p)
@@ -299,6 +369,7 @@ async def on_message(message: cl.Message):
         except Exception as e:
             await cl.Message(content=f"⚠️ Couldn’t upload: {os.path.basename(p)} ({e})").send()
 
+    # Send message to Gemini (text + uploaded files)
     try:
         if gem_files:
             content = [text] + gem_files if text else gem_files
@@ -322,8 +393,6 @@ async def on_message(message: cl.Message):
         print("Gemini error detail:", repr(e))
         loader.content = f"❌ Gemini error: {e}"
         await loader.update()
-
-
 
 # ----------------- ACTION: SHOW PINS -----------------
 @cl.action_callback("show_pins")
