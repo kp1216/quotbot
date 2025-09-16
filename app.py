@@ -319,11 +319,12 @@ async def on_message(message: cl.Message):
             # Upload each CSV to Gemini and pin
             for p in csv_paths:
                 try:
-                    fh = genai.upload_file(path=p, mime_type="text/csv")
+                    mt = guess_mime_type(p)  # Correct MIME type for CSV
+                    fh = genai.upload_file(path=p, mime_type=mt)
                     gem_files.append(fh)
                     if supabase:
                         try:
-                            pin_file_supabase(cl.user_session.get("user_id"), p, "text/csv", overwrite=True)
+                            pin_file_supabase(cl.user_session.get("user_id"), p, mt, overwrite=True)
                         except Exception as pe:
                             print("Supabase pin (csv) failed:", repr(pe))
                 except Exception as up_e:
@@ -332,7 +333,7 @@ async def on_message(message: cl.Message):
             # Also pin the original Excel (optional, for your audit trail)
             if supabase:
                 try:
-                    mt_x = guess_mime_type(excel_paths[-1])
+                    mt_x = guess_mime_type(excel_paths[-1])  # Ensure correct MIME type for Excel
                     pin_file_supabase(cl.user_session.get("user_id"), excel_paths[-1], mt_x, overwrite=True)
                 except Exception as pe:
                     print("Supabase pin (excel) failed:", repr(pe))
@@ -358,7 +359,7 @@ async def on_message(message: cl.Message):
     # Upload any non-excel attachments (pdf/images/etc) to Gemini + pin
     for p in other_paths:
         try:
-            mt = guess_mime_type(p)
+            mt = guess_mime_type(p)  # Correct MIME type for each file
             fh = genai.upload_file(path=p, mime_type=mt)
             gem_files.append(fh)
             if supabase:
