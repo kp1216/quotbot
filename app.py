@@ -1,3 +1,286 @@
+# app.py
+import os
+import mimetypes
+from pathlib import Path
+import hashlib
+import uuid
+import io
+import tempfile
+import zipfile
+
+import pandas as pd
+import google.generativeai as genai
+import chainlit as cl
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+# ----------------- ENV & MODEL -----------------
+load_dotenv()
+
+API_KEY   = os.getenv("GEMINI_API")
+MODELNAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+# Excel→CSV behavior (optional envs)
+EXCEL_SHEETS_MODE   = os.getenv("EXCEL_SHEETS_MODE", "all").strip().lower()  # "all" or "first"
+INCLUDE_INDEX_IN_CSV = os.getenv("INCLUDE_INDEX_IN_CSV", "false").strip().lower() in ("1","true","yes")
+MAX_SHEETS_TO_UPLOAD = int(os.getenv("MAX_SHEETS_TO_UPLOAD", "10"))
+
+BASE_SYSTEM_PROMPT = (
+    "You are a friendly assistant. Answer naturally like ChatGPT.\n"
+    "If an Inventory Snapshot is provided below, prefer to ground inventory-related answers in it. "
+    "Do not fabricate values; if the snapshot lacks required info, say exactly what is missing and ask for it. "
+    "Use concise language and small Markdown tables when helpful.\n\n"
+    "IMPORTANT: Only reference the snapshot when relevant. For general questions, answer normally."
+)
+
+if not API_KEY:
+    print("⚠️ WARNING: GEMINI_API is missing in .env or Secrets")
+else:
+    genai.configure(api_key=API_KEY)
+
+def build_model(system_instruction: str):
+    return genai.GenerativeModel(model_name=MODELNAME, system_instruction=system_instruction)
+
+# ----------------- MIME HELPER -----------------
+MIME_OVERRIDES = {
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls":  "application/vnd.ms-excel",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".csv":  "text/csv",
+    ".json": "application/json",
+    ".md":   "text/markdown",
+    ".txt":  "text/plain",
+    ".pdf":  "application/pdf",
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+def guess_mime_type(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    if ext in MIME_OVERRIDES:
+        return MIME_OVERRIDES[ext]
+    mt, _ = mimetypes.guess_type(path)
+    return mt or "application/octet-stream"
+
+# ----------------- SUPABASE -----------------
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_SERVICE_KEY")
+    or os.getenv("SUPABASE_ANON_KEY")
+    or os.getenv("SUPABASE_KEY")  # fallback to old name
+)
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "pins")
+
+supabase: Client | None = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    print("⚠️ Supabase not configured (missing URL or KEY)")
+
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def pin_file_supabase(user_id: str, local_path: str, mime_type: str, overwrite: bool = False) -> dict:
+    """
+    Upload file to Supabase Storage and insert metadata into 'pinned_files'.
+    """
+    assert supabase is not None, "Supabase not configured"
+    filename    = os.path.basename(local_path)
+    digest      = _sha256(local_path)
+    size_bytes  = os.path.getsize(local_path)
+    storage_key = f"{user_id}/{digest}_{filename}"
+
+    file_options = {"content-type": mime_type}
+    if overwrite:
+        file_options["upsert"] = "true"
+
+    with open(local_path, "rb") as f:
+        supabase.storage.from_(SUPABASE_BUCKET).upload(
+            storage_key, f, file_options
+        )
+
+    row = {
+        "user_id": user_id,
+        "filename": filename,
+        "mime_type": mime_type,
+        "size_bytes": size_bytes,
+        "sha256": digest,
+        "storage_path": storage_key,
+    }
+    supabase.table("pinned_files").insert(row).execute()
+    return row
+
+def list_pins_supabase(user_id: str) -> list[dict]:
+    assert supabase is not None, "Supabase not configured"
+    res = supabase.table("pinned_files").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+    return res.data or []
+
+def signed_url(storage_key: str, expires_sec: int = 3600) -> str:
+    assert supabase is not None, "Supabase not configured"
+    return supabase.storage.from_(SUPABASE_BUCKET).create_signed_url(storage_key, expires_sec)["signedURL"]
+
+# ----------------- DATA HELPERS -----------------
+def read_excel_all_sheets(path: str) -> pd.DataFrame:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xlsx":
+        sheets = pd.read_excel(path, sheet_name=None, engine="openpyxl")
+    elif ext == ".xls":
+        sheets = pd.read_excel(path, sheet_name=None, engine="xlrd")
+    else:
+        raise ValueError("Only Excel files are supported: .xlsx or .xls")
+    frames = []
+    for sname, df in sheets.items():
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            d2 = df.copy()
+            d2["__sheet__"] = sname
+            frames.append(d2)
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+def make_snapshot(df: pd.DataFrame, max_rows: int = 120, max_cols: int = 20, max_chars: int = 18_000) -> str:
+    if df is None or df.empty:
+        return "NO_DATA"
+
+    use_cols = list(df.columns)[:max_cols]
+    dsmall = df[use_cols].copy()
+    for c in use_cols:
+        dsmall[c] = dsmall[c].astype(str)
+
+    head = (
+        "Columns: " + " | ".join([str(c) for c in use_cols]) +
+        f"\nTotal Rows: {len(df)} (showing first {min(len(df), max_rows)})"
+    )
+    csv = dsmall.head(max_rows).to_csv(index=False)
+
+    if len(csv) > max_chars:
+        csv = csv[:max_chars] + "\n...TRUNCATED..."
+
+    snap = head + "\n\nCSV Preview (capped):\n" + csv
+
+    if len(snap) > max_chars + 2000:
+        snap = (
+            "Columns: " + " | ".join([str(c) for c in use_cols]) +
+            f"\nTotal Rows: {len(df)}\n\nCSV Preview (capped):\n(TRUNCATED)"
+        )
+    return snap
+
+def build_system_with_snapshot(snapshot: str | None) -> str:
+    base = BASE_SYSTEM_PROMPT
+    if snapshot and snapshot.strip() and snapshot != "NO_DATA":
+        chunk = snapshot[:20_000]
+        return base + (
+            "\n---\nINVENTORY SNAPSHOT (for grounding when relevant). "
+            "Do not dump this verbatim; cite only the bits you use:\n" + chunk
+        )
+    return base
+
+async def ensure_chat():
+    chat = cl.user_session.get("chat")
+    if chat is None:
+        model = cl.user_session.get("model")
+        if model is None:
+            sys = build_system_with_snapshot(cl.user_session.get("snapshot"))
+            model = build_model(sys)
+            cl.user_session.set("model", model)
+        chat = model.start_chat(history=[])
+        cl.user_session.set("chat", chat)
+    return chat
+
+async def rebuild_with_snapshot(snapshot: str | None):
+    cl.user_session.set("snapshot", snapshot)
+    sys = build_system_with_snapshot(snapshot)
+    model = build_model(sys)
+    cl.user_session.set("model", model)
+    chat = model.start_chat(history=[])
+    cl.user_session.set("chat", chat)
+    return chat
+
+def is_excel(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in (".xlsx", ".xls")
+
+# -------- Excel → CSV conversion (integrated from your Gradio app) --------
+def _safe_name(s: str) -> str:
+    return "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in (s or "")).strip() or "Sheet"
+
+def excel_to_csv_paths(excel_path: str, mode: str = "all", include_index: bool = False, max_sheets: int = 10) -> list[str]:
+    """
+    Returns a list of CSV file paths (one per selected sheet).
+    - mode: 'all' (default) or 'first'
+    - include_index: include pandas index column in CSV
+    - max_sheets: cap how many sheets to export (safety)
+    """
+    if not excel_path:
+        return []
+    xls = pd.ExcelFile(excel_path)
+    sheets = xls.sheet_names or []
+    if not sheets:
+        return []
+
+    out_paths: list[str] = []
+    chosen = sheets if mode == "all" else sheets[:1]
+    chosen = chosen[:max_sheets]
+
+    base = os.path.splitext(os.path.basename(excel_path))[0]
+    for s in chosen:
+        df = pd.read_excel(excel_path, sheet_name=s)
+        safe_sheet = _safe_name(s)
+        out_name = f"{base}__{safe_sheet}.csv"
+        out_path = os.path.join(tempfile.gettempdir(), next(tempfile._get_candidate_names()) + "_" + out_name)
+        df.to_csv(out_path, index=include_index, encoding="utf-8-sig")
+        out_paths.append(out_path)
+
+    return out_paths
+
+# ----------------- UI -----------------
+LOADER_HTML = """<div style="display:inline-block; padding:6px 2px;">
+  <svg width="60" height="18" viewBox="0 0 60 18" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="10" cy="9" r="4" fill="currentColor">
+      <animate attributeName="cy" values="9;3;9" dur="0.8s" repeatCount="indefinite" begin="0s"/>
+    </circle>
+    <circle cx="30" cy="9" r="4" fill="currentColor">
+      <animate attributeName="cy" values="9;3;9" dur="0.8s" repeatCount="indefinite" begin="0.15s"/>
+    </circle>
+    <circle cx="50" cy="9" r="4" fill="currentColor">
+      <animate attributeName="cy" values="9;3;9" dur="0.8s" repeatCount="indefinite" begin="0.30s"/>
+    </circle>
+  </svg>
+</div>"""
+
+@cl.on_chat_start
+async def on_start():
+    sys = build_system_with_snapshot(None)
+    model = build_model(sys)
+    chat = model.start_chat(history=[])
+
+    cl.user_session.set("model", model)
+    cl.user_session.set("chat", chat)
+    cl.user_session.set("snapshot", None)
+
+    if not cl.user_session.get("user_id"):
+        cl.user_session.set("user_id", str(uuid.uuid4()))
+
+    await cl.Message(
+        content="Click to view your pinned files.",
+        actions=[cl.Action(name="show_pins", value="show", label="📎 Pinned Files", payload={})]
+    ).send()
+
+    await cl.Message(
+        content=(
+            "Hi! 👋 I chat like ChatGPT.\n\n"
+            "Use the **paperclip** to attach your Excel inventory (and PDFs/images). "
+            "I’ll remember a snapshot and use it when relevant.\n"
+            "_Excel files are auto-converted to CSV and sent to Gemini for you._"
+        )
+    ).send()
+
+# ----------------- MESSAGE HANDLER -----------------
 @cl.on_message
 async def on_message(message: cl.Message):
     text = message.content or ""
@@ -99,3 +382,27 @@ async def on_message(message: cl.Message):
         print("Gemini error detail:", repr(e))
         loader.content = f"❌ Gemini error: {e}"
         await loader.update()
+
+
+# ----------------- ACTION: SHOW PINS -----------------
+@cl.action_callback("show_pins")
+async def _show_pins(action):
+    if not supabase:
+        await cl.Message(content="Pins DB not configured.").send()
+        return
+
+    user_id = cl.user_session.get("user_id")
+    rows = list_pins_supabase(user_id)
+    if not rows:
+        await cl.Message(content="No pinned files yet.").send()
+        return
+
+    lines = []
+    for r in rows[:20]:
+        try:
+            url = signed_url(r["storage_path"], 3600)
+            size = r.get("size_bytes") or 0
+            lines.append(f"- [{r['filename']}]({url})  \n  {size} bytes")
+        except Exception:
+            lines.append(f"- {r['filename']} (cannot create link)")
+    await cl.Message(content="**Pinned files:**\n" + "\n".join(lines)).send()
